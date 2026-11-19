@@ -1,0 +1,9 @@
+laws/
+rules/
+data/
+laws_out/
+browser_profile/
+__pycache__/
+*.log
+account.json
+config.json

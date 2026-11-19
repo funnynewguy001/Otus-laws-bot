@@ -1,0 +1,62 @@
+# Бот базы законов: каждую ночь в 02:00 МСК (и по кнопке) качает с форума правила и законы всех штатов
+# и выкладывает архивы в релиз `laws` репозитория Otus-SKDA. Программа берёт оттуда базу
+# выбранного штата — без браузера, входа на форум и VPN.
+#
+# Работает на серверах GitHub (ubuntu-latest) — не зависит от ПК владельца.
+# Вход — служебный аккаунт бота (секреты FORUM_LOGIN / FORUM_PASSWORD), выкладка — RELEASE_TOKEN.
+# Расписание срабатывает только для файла в ветке main.
+name: laws-bot
+
+on:
+  schedule:
+    - cron: "0 23 * * *"         # 02:00 по Москве (UTC+3): ночью на форуме мало людей
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Один штат (id, например orlando) или rules. Пусто — все."
+        required: false
+        default: ""
+      batch:
+        description: "Сколько баз за запуск (самые старые/недостающие первыми). Пусто — все."
+        required: false
+        default: ""
+
+concurrency:
+  group: laws-bot
+  cancel-in-progress: false      # идущую загрузку не обрываем
+
+jobs:
+  laws:
+    name: Бот базы законов
+    # На серверах GitHub, а не на ПК владельца: бот не должен зависеть от того, включён ли
+    # компьютер, и ходит на форум не с домашнего адреса владельца.
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Зависимости (только то, что нужно боту)
+        # requirements.txt — для программы (PyQt, голос, клавиатура); боту хватает браузера
+        run: python -m pip install "playwright==1.65.2" "certifi>=2026.10.23" --disable-pip-version-check -q
+      - name: Браузер для форума (Playwright Chromium + системные библиотеки)
+        run: python -m playwright install --with-deps chromium
+      - name: Скачать и выложить базы
+        env:
+          OTUS_FORUM_LOGIN: ${{ secrets.FORUM_LOGIN }}
+          OTUS_FORUM_PASSWORD: ${{ secrets.FORUM_PASSWORD }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          ONLY: ${{ inputs.only }}      # через переменную, не вставкой в команду (без инъекций)
+          BATCH: ${{ inputs.batch }}
+        # xvfb-run — виртуальный экран: браузер настоящий (с окном), но экрана у сервера нет
+        run: |
+          if [ -n "$ONLY" ]; then xvfb-run -a python tools/laws_bot.py --only "$ONLY"
+          elif [ -n "$BATCH" ] && [ "$BATCH" -eq "$BATCH" ] 2>/dev/null; then xvfb-run -a python tools/laws_bot.py --batch "$BATCH"
+          else xvfb-run -a python tools/laws_bot.py; fi
