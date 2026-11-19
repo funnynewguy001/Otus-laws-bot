@@ -302,7 +302,30 @@ def _auto_login(page, section_url) -> bool:
         return False
     ok = is_logged_in(page)
     log("Бот: вход выполнен." if ok else "Бот: форум не пустил (неверный пароль, капча или защита).")
+    if not ok:
+        _login_diag(page, login)
     return ok
+
+
+def _login_diag(page, login: str):
+    """Почему не пустило — без логина/пароля в журнале: адрес и заголовок страницы, текст ошибки
+    форума (логин из него вырезается), есть ли капча / проверка браузера."""
+    try:
+        err = ""
+        for sel in (".blockMessage--error", ".formRow-explain.is-error", ".js-loginErrorMessage",
+                    ".overlay-content .blockMessage"):
+            el = page.query_selector(sel)
+            if el:
+                err = (el.inner_text() or "").strip()
+                break
+        if login and err:
+            err = err.replace(login, "<логин>")
+        cap = bool(page.query_selector("iframe[src*='captcha'], iframe[src*='turnstile'], "
+                                       ".g-recaptcha, .h-captcha, [data-sitekey]"))
+        log(f"  страница: {urlsplit(page.url).path or '/'} · «{(page.title() or '')[:80]}»")
+        log(f"  ошибка форума: {err[:200] or '—'} · капча: {'да' if cap else 'нет'}")
+    except Exception as e:
+        log(f"  подробности недоступны ({type(e).__name__})")
 
 
 def ensure_login(page, section_url, need_section=True):
