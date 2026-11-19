@@ -36,6 +36,7 @@ PREFIX = "forum_"            # файлы с форума; свои файлы �
 MIN_GAP = 2.5                # минимум секунд между запросами к форуму
 MAX_GAP = 20.0               # до скольки замедляемся, если форум начал придерживать
 BOT_GAP = 6.0                # бот базы: сразу спокойный темп (страниц много, штатов 19)
+SILENT_WAIT = 120            # форум перестал отвечать (таймауты) — столько ждём перед повтором
 DELAY = MIN_GAP              # оставлено для совместимости со старым кодом
 
 _last_req = [0.0]            # когда был прошлый запрос
@@ -884,12 +885,18 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
         held = False        # форум начал придерживать запросы — уставы добираем позже
         partial = False     # что-то не скачалось — старые документы не удаляем (save_results)
 
-        def reopen():
-            """Браузер/вкладка закрылись посреди загрузки — открываем заново и идём дальше.
-            Раньше после этого КАЖДЫЙ следующий раздел падал «browser has been closed»."""
+        def reopen(why="браузер закрылся"):
+            """Браузер/вкладка закрылись (или вкладка зависла) посреди загрузки — открываем
+            заново и идём дальше. Раньше после этого КАЖДЫЙ следующий раздел падал
+            «browser has been closed» / «Timeout 45000ms»."""
             nonlocal context, page
+            old = page
             try:
                 page = context.new_page()
+                try:
+                    old.close()     # зависшую вкладку закрываем, чтобы не копились
+                except Exception:
+                    pass
             except Exception:
                 try:
                     context.close()
@@ -897,8 +904,9 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
                     pass
                 context = open_browser(p)
                 page = context.pages[0] if context.pages else context.new_page()
-            log("  браузер закрылся — открыл заново, продолжаю")
+            log(f"  {why} — открыл заново, продолжаю")
 
+        silent = 0          # сколько разделов подряд форум не ответил (таймаут)
         for cs in charter_sections:
             if held:
                 break
@@ -906,18 +914,37 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
             for attempt in range(2):
                 try:
                     ct = collect_charter_threads(page, cs)
+                    silent = 0
                     break
                 except Throttled:
                     held = True
                     break
                 except Exception as e:
-                    if attempt == 0 and "closed" in str(e).lower():
+                    msg = str(e).lower()
+                    if attempt == 0 and "closed" in msg:
                         reopen()
                         continue
-                    log(f"  уставы, раздел пропущен: {e}")
+                    if attempt == 0 and "timeout" in msg:
+                        # Форум перестал отвечать (19.11: после 5 уставов все 7 разделов
+                        # подряд — таймаут, база вышла урезанной). Это та же «придержка»,
+                        # только молчаливая: пережидаем, замедляемся, свежая вкладка.
+                        gap = _slow_down()
+                        log(f"  форум не отвечает: жду {SILENT_WAIT} с, дальше по одной "
+                            f"странице в {gap} с")
+                        time.sleep(SILENT_WAIT)
+                        reopen("вкладка зависла")
+                        continue
+                    log(f"  уставы, раздел пропущен: {str(e).splitlines()[0][:200]}")
                     partial = True
                     ct = []
+                    if "timeout" in msg:
+                        silent += 1
                     break
+            if silent >= 2:
+                # Два раздела подряд молчат даже после паузы — дальше только продлевать
+                # блок. Скачанное сохраняем, остальные уставы доберём следующей ночью.
+                held = True
+                break
             for url, t in ct:
                 if url in seen:
                     continue
