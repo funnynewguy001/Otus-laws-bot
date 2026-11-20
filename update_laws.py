@@ -408,11 +408,51 @@ def _cached_text(out_dir, cache, url):
 
 def _save_cache(out_dir, results):
     try:
-        d = {url: {"t": THREAD_TIME.get(url, ""), "title": title} for title, url, _ in results}
+        # Прошлые записи не теряем: при неполной загрузке (форум придержал) недокачанные темы
+        # остаются файлами (keep_missing), и в следующий раз их не надо качать заново.
+        d = {u: v for u, v in _load_cache(out_dir).items() if isinstance(v, dict)}
+        d.update({url: {"t": THREAD_TIME.get(url, ""), "title": title} for title, url, _ in results})
         with open(os.path.join(out_dir, CACHE_FILE), "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=0)
     except Exception as e:
         log(f"Список тем для «без изменений» не сохранён ({e}) — в следующий раз скачается всё")
+
+
+SECTIONS_FILE = "_sections.json"   # разделы уставов: когда последний раз удалось / сколько раз подряд нет
+
+
+def _load_sections(out_dir) -> dict:
+    try:
+        with open(os.path.join(out_dir, SECTIONS_FILE), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, dict)} \
+            if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _order_sections(sections: list, state: dict) -> list:
+    """Сначала разделы, которые ещё ни разу не удались, потом — давно не обновлявшиеся;
+    свежие — в конце; упорно не открывающиеся (2+ раза подряд) — в самом конце.
+    19–20.11: бот каждую ночь шёл по разделам в одном порядке и упирался в одно и то же
+    место — уставы после пятого не скачались ни разу (Orlando: 39 документов вместо ~80)."""
+    def key(item):
+        i, u = item
+        s = state.get(u) if isinstance(state, dict) else None
+        s = s if isinstance(s, dict) else {}            # запись испорчена — как новый раздел
+        fail = s.get("fail") if isinstance(s.get("fail"), int) else 0
+        ok = s.get("ok") if isinstance(s.get("ok"), str) else ""
+        return (fail >= 2, fail, ok, i)        # не открывшийся в прошлый раз — после нетронутых
+    return [u for _, u in sorted(enumerate(sections), key=key)]
+
+
+def _save_sections(out_dir, state: dict):
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, SECTIONS_FILE), "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=0)
+    except Exception as e:
+        log(f"Порядок разделов уставов не сохранён ({e})")
 
 
 def collect_threads(page, section_url) -> list[tuple[str, str]]:
@@ -906,6 +946,12 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
                 page = context.pages[0] if context.pages else context.new_page()
             log(f"  {why} — открыл заново, продолжаю")
 
+        sec_state = _load_sections(out_dir)
+        charter_sections = _order_sections(charter_sections, sec_state)
+        if charter_sections and os.environ.get("OTUS_FORUM_LOGIN"):
+            # бот: после законов даём форуму передышку, уставы — отдельной «порцией»
+            log(f"  передышка перед уставами: {SILENT_WAIT} с")
+            time.sleep(SILENT_WAIT)
         silent = 0          # сколько разделов подряд форум не ответил (таймаут)
         for cs in charter_sections:
             if held:
@@ -915,6 +961,7 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
                 try:
                     ct = collect_charter_threads(page, cs)
                     silent = 0
+                    sec_state[cs] = {"ok": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), "fail": 0}
                     break
                 except Throttled:
                     held = True
@@ -937,6 +984,9 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
                     log(f"  уставы, раздел пропущен: {str(e).splitlines()[0][:200]}")
                     partial = True
                     ct = []
+                    prev = sec_state.get(cs) or {}
+                    sec_state[cs] = {"ok": prev.get("ok", "") if isinstance(prev.get("ok"), str) else "",
+                                     "fail": (prev.get("fail") if isinstance(prev.get("fail"), int) else 0) + 1}
                     if "timeout" in msg:
                         silent += 1
                     break
@@ -986,6 +1036,8 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
     rc = save_results(out_dir, results, keep_missing=held or partial)
     if rc == 0:
         _save_cache(out_dir, results)
+        if sec_state:
+            _save_sections(out_dir, sec_state)
     return rc
 
 
