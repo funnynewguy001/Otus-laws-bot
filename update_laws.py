@@ -694,6 +694,10 @@ def collect_charter_threads(page, section_url) -> list[tuple[str, str]]:
         if not m or m.group(2) in seen:
             continue
         if not CHARTER_TITLE_RE.search(text) or CHARTER_DEAD_RE.search(text):
+            # в журнал — чтобы было видно, какие документы ведомств не попадают в базу
+            # (владелец, 20.11.2026: «раньше было 80, сейчас 47 — почему не все»)
+            why = "устарел" if CHARTER_DEAD_RE.search(text) else "не устав по названию"
+            log(f"    (пропуск: {why}: {text[:100]})")
             continue
         if m.group(2) in CHARTER_TRAP_IDS or CHARTER_TRAP_RE.search(text):
             log(f"    (тема-ловушка, не открываю: {text})")
