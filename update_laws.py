@@ -365,16 +365,23 @@ def ensure_login(page, section_url, need_section=True):
 # По ней не перекачиваем темы, которые с прошлого раза не менялись (_cached_text).
 THREAD_TIME: dict = {}
 CACHE_FILE = "_threads.json"
+# Дата последнего сообщения темы в списке раздела. 20.11.2026: у всех 48 тем Orlando дата
+# оказалась пустой — форум (XenForo 2.3) пишет её в data-timestamp/datetime, а не data-time,
+# и «не качать то, что не менялось» не работало: бот каждый раз перекачивал всё и тратил на
+# это лимит форума. Берём любой из атрибутов.
 _JS_LATEST = ("e => { const it = e.closest('.structItem'); if (!it) return '';"
-              " const t = it.querySelector('.structItem-cell--latest time[data-time],"
-              " .structItem-latestDate[data-time]'); return t ? (t.getAttribute('data-time') || '') : ''; }")
+              " const t = it.querySelector('.structItem-cell--latest time, .structItem-latestDate,"
+              " .structItem-cell--latest [data-time], .structItem-cell--latest [data-timestamp]');"
+              " if (!t) return '';"
+              " return t.getAttribute('data-timestamp') || t.getAttribute('data-time')"
+              " || t.getAttribute('datetime') || t.getAttribute('title') || ''; }")
 
 
 def _note_time(a, url):
     try:
         t = a.evaluate(_JS_LATEST)
-        if isinstance(t, str) and t.isdigit():
-            THREAD_TIME[url] = t
+        if isinstance(t, str) and 0 < len(t.strip()) <= 64:
+            THREAD_TIME[url] = t.strip()
     except Exception:
         pass                      # нет даты — тема просто скачается, как раньше
 
@@ -442,7 +449,11 @@ def _order_sections(sections: list, state: dict) -> list:
         s = s if isinstance(s, dict) else {}            # запись испорчена — как новый раздел
         fail = s.get("fail") if isinstance(s.get("fail"), int) else 0
         ok = s.get("ok") if isinstance(s.get("ok"), str) else ""
-        return (fail >= 2, fail, ok, i)        # не открывшийся в прошлый раз — после нетронутых
+        # нетронутые → недавно не открывшиеся (1–2 раза: форум придержал, сам раздел живой) →
+        # уже скачанные, давние первыми → упорно молчащие (3+) в самом конце. 20.11: уже скачанные
+        # шли раньше недокачанных, бот тратил на них весь лимит, и Минобороны не доходил никогда.
+        tier = 0 if (not ok and not fail) else (1 if fail else 2)
+        return (fail >= 3, tier, ok, i)
     return [u for _, u in sorted(enumerate(sections), key=key)]
 
 
@@ -890,7 +901,8 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
                 if url not in seen:
                     seen.add(url)
                     threads.append((url, t))
-        log(f"Найдено тем: {len(threads)}")
+        log(f"Найдено тем: {len(threads)} (дата последнего сообщения известна у "
+            f"{sum(1 for u, _ in threads if THREAD_TIME.get(u))})")
         if not threads:
             log("Темы не найдены — старые файлы не тронуты. Возможно, ссылка на раздел устарела (servers.py).")
             context.close()
