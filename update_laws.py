@@ -568,6 +568,20 @@ CHARTER_TITLE_RE = re.compile(r"устав|регламент|положени",
 # (иначе под фильтр попал бы, например, «Устав Gold Coast PD»).
 CHARTER_DEAD_RE = re.compile(r"устарел|недейств|не\s*актуал|отмен[её]н|архив|старая\s*верси|"
                              r"\bold\b|черновик|проект\s+устава", re.IGNORECASE)
+# Темы-ловушки: при открытии форум рвёт соединение (ERR_FAILED) и закрывает доступ всему
+# адресу. 20.11.2026 «Регламент проведения плановых финансовых проверок…» (тема 3611761):
+# и бот на GitHub, и загрузка с ПК владельца каждый раз ломались ровно на ней, после чего
+# форум переставал пускать. Это не устав ведомства — не открываем вовсе.
+CHARTER_TRAP_RE = re.compile(r"финансов\w*\s+провер", re.IGNORECASE)
+CHARTER_TRAP_IDS = {"3611761"}
+
+
+def _cut_off(e) -> bool:
+    """Форум рвёт соединение (а не просто медлит): ERR_FAILED / ERR_CONNECTION_* / сброс.
+    После такого любой следующий запрос только продлевает блок адреса."""
+    s = str(e)
+    return any(k in s for k in ("net::ERR_FAILED", "ERR_CONNECTION_", "ERR_EMPTY_RESPONSE",
+                                "ERR_TIMED_OUT", "ERR_NAME_NOT_RESOLVED"))
 
 
 def _node_threads(link) -> int:
@@ -669,6 +683,9 @@ def collect_charter_threads(page, section_url) -> list[tuple[str, str]]:
         if not m or m.group(2) in seen:
             continue
         if not CHARTER_TITLE_RE.search(text) or CHARTER_DEAD_RE.search(text):
+            continue
+        if m.group(2) in CHARTER_TRAP_IDS or CHARTER_TRAP_RE.search(text):
+            log(f"    (тема-ловушка, не открываю: {text})")
             continue
         seen.add(m.group(2))
         tid = int(m.group(2))
@@ -968,6 +985,10 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
                     break
                 except Exception as e:
                     msg = str(e).lower()
+                    if _cut_off(e):
+                        log(f"  форум оборвал соединение — останавливаю уставы: {str(e).splitlines()[0][:160]}")
+                        partial = held = True
+                        break
                     if attempt == 0 and "closed" in msg:
                         reopen()
                         continue
@@ -1016,8 +1037,13 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
                     held = True
                     break
                 except Exception as e:
-                    log(f"    ошибка: {e}")
+                    log(f"    ошибка: {str(e).splitlines()[0][:200]}")
                     partial = True
+                    if _cut_off(e):
+                        # форум оборвал соединение — дальше только продлевать блок: стоп,
+                        # скачанное сохраняем, остальное доберём в следующий раз
+                        held = True
+                        break
                     if "closed" in str(e).lower():
                         reopen()
             # отдельная пауза не нужна: темп держит _pace() на каждом запросе
