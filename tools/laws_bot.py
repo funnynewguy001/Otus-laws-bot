@@ -77,7 +77,8 @@ def _zip(name: str, entries: list[str]) -> str | None:
         elif os.path.isdir(p):
             for dp, _, fn in os.walk(p):
                 for f in fn:
-                    if f.endswith((".txt", ".json")):
+                    # _cloud.json — отметка у человека «какая версия с GitHub стоит», в архив не кладём
+                    if f.endswith((".txt", ".json")) and f != "_cloud.json":
                         files.append(os.path.relpath(os.path.join(dp, f), ROOT))
     if not any(f.endswith(".txt") for f in files):
         return None

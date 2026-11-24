@@ -89,6 +89,64 @@ def _swap_dir(new: str, dst: str) -> None:
     shutil.rmtree(old, ignore_errors=True)
 
 
+MARKER = "_cloud.json"     # какая версия базы с GitHub стоит у человека: sha256 архива и дата
+
+
+def _local_dir(sid: str) -> str:
+    return os.path.join(APP_DIR, "rules") if sid == "rules" else os.path.join(APP_DIR, "laws", sid)
+
+
+def _read_json(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cloud_newer(cloud_iso: str, local_iso) -> bool:
+    """База на GitHub (дата «…Z», UTC) новее местной (_updated.json — время этого ПК) на час и больше.
+    Дату не разобрали — считаем, что новее: лучше взять свежую, чем остаться со старой."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        cloud = datetime.strptime(str(cloud_iso)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        local = datetime.fromisoformat(str(local_iso)[:19])
+        if local.tzinfo is None:
+            local = local.astimezone()            # время этого ПК
+        return cloud - local.astimezone(timezone.utc) > timedelta(hours=1)
+    except (TypeError, ValueError):
+        return True
+
+
+def stale(sids, log=lambda m: None) -> list:
+    """Какие базы из sids на GitHub новее, чем у человека (для автообновления, владелец 24.11.2026:
+    «обновления законов постоянно» — раньше программа брала базу с GitHub только если её не было
+    вовсе, и у людей неделями лежали старые копии). Нет сети / кривой index.json — пустой список:
+    ничего не трогаем. Базы, которой у человека нет вовсе, тут нет — её качает автозагрузка штата."""
+    try:
+        index = json.loads(_get(BASE_URL + "index.json", 2 * 1024 * 1024).decode("utf-8"))
+    except Exception as e:
+        log(f"автообновление: index.json не получен ({type(e).__name__})")
+        return []
+    out = []
+    for sid in sids:
+        rec = _record(index, sid)
+        d = _local_dir(sid)
+        if not rec or not os.path.isdir(d):
+            continue
+        mark = _read_json(os.path.join(d, MARKER))
+        if mark.get("sha256") == rec["sha256"]:
+            continue                               # у человека уже эта версия
+        if not mark:
+            # базу человек качал с форума сам (отметки нет): меняем, только если на GitHub заметно новее
+            upd = _read_json(os.path.join(d, "_updated.json")).get("updated")
+            if upd and not _cloud_newer(rec["date"], upd):
+                continue
+        out.append(sid)
+    return out
+
+
 def fetch(sid: str, log=print) -> bool:
     """Скачать базу штата (или sid="rules") с GitHub. True — база на месте; False — идти на форум."""
     try:
@@ -107,7 +165,7 @@ def fetch(sid: str, log=print) -> bool:
             log("Архив с GitHub повреждён (не сходится контрольная сумма) — качаю с форума.")
             return False
         z = zipfile.ZipFile(io.BytesIO(data))
-        names = [n for n in z.namelist() if _allowed(n, sid)]
+        names = [n for n in z.namelist() if _allowed(n, sid) and not n.endswith("/" + MARKER)]
         if not any(n.endswith(".txt") for n in names):
             log("Архив с GitHub пустой — качаю с форума.")
             return False
@@ -118,6 +176,14 @@ def fetch(sid: str, log=print) -> bool:
                 os.makedirs(os.path.dirname(p), exist_ok=True)
                 with z.open(n) as src, open(p, "wb") as out:
                     shutil.copyfileobj(src, out)
+            # Отметка «какая версия с GitHub стоит» — по ней автообновление (stale) понимает, что
+            # базу менять не нужно. Кладём ДО замены папки: новая база и отметка появляются разом.
+            try:
+                inner = os.path.join(tmp, "rules") if sid == "rules" else os.path.join(tmp, "laws", sid)
+                with open(os.path.join(inner, MARKER), "w", encoding="utf-8") as f:
+                    json.dump({"sha256": rec["sha256"], "date": rec["date"]}, f)
+            except Exception:
+                pass                      # без отметки база всё равно рабочая — сверим по дате
             if sid == "rules":
                 _swap_dir(os.path.join(tmp, "rules"), os.path.join(APP_DIR, "rules"))
             else:

@@ -669,6 +669,46 @@ def discover_charter_sections(page, cat_id: int) -> list[str]:
     return []
 
 
+# «Дополнительные серверные правила» — отдельная категория на главной форума (НЕ в категории штата),
+# в ней у каждого штата свой подраздел (у Orlando — forums/orlando.1455). Владелец 24.11.2026: «добавь».
+# Их собирает и Sinset Helper (по 2 документа на штат, у Las Vegas 4), а наш бот их пропускал.
+SERVER_RULES_CATEGORY_RE = re.compile(r"дополнительн\w*\s+серверн\w*\s+правил", re.IGNORECASE)
+
+
+def find_server_rules_section(page, state_name: str) -> str | None:
+    """Подраздел «Дополнительных серверных правил» этого штата. Читаем ТЕКУЩУЮ страницу —
+    главную форума уже открыл discover_charter_sections, лишнего запроса к форуму нет.
+
+    На форуме (проверено вживую 24.11.2026) это узел-категория ВНУТРИ блока «Правила проекта
+    Majestic РП»: div.node с заголовком .node-title, подразделы всех штатов перечислены прямо в нём
+    (Orlando → /forums/orlando.1455/). Отдельного блока div.block--category у неё нет — первая версия
+    искала именно его и не нашла бы никогда. Блок категории оставлен запасным вариантом: если форум
+    вынесет её наверх. Не нашли (вёрстка поменялась, штата нет) — None: законы и уставы как раньше.
+    Ссылки «последнее сообщение» (/threads/, /members/) в узле не берём: только /forums/."""
+    want = re.sub(r"[^a-zа-яё]", "", (state_name or "").lower())
+    if not want:
+        return None
+    try:
+        boxes = page.query_selector_all("div.node, div.block--category")
+    except Exception:
+        return None
+    seen_cat = False
+    for b in boxes:
+        # своё название узла/блока идёт в разметке первым — вложенные узлы его не перебьют
+        head = b.query_selector(".node-title, .block-header")
+        if not SERVER_RULES_CATEGORY_RE.search((head.text_content() if head else "") or ""):
+            continue
+        seen_cat = True
+        for a in b.query_selector_all("a[href*='/forums/']"):
+            name = re.sub(r"[^a-zа-яё]", "", (a.text_content() or "").lower())
+            m = re.search(r"(/forums/[^/?#]*\.(\d+))", a.get_attribute("href") or "")
+            if m and name and (name == want or want in name):
+                return urljoin(FORUM + "/", m.group(1) + "/")
+    log("  серверные правила: в категории нет подраздела этого штата" if seen_cat else
+        "  серверные правила: категория «Дополнительные серверные правила» на главной не найдена")
+    return None
+
+
 def _charter_key(title: str) -> str:
     """Название устава без версий и дат — чтобы узнать две версии одного документа."""
     t = title.lower()
@@ -881,7 +921,7 @@ def save_results(out_dir: str, results: list, keep_missing: bool = False) -> int
 
 
 def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str] | None = None,
-        cat_id: int | None = None) -> int:
+        cat_id: int | None = None, state_name: str = "") -> int:
     from playwright.sync_api import sync_playwright
 
     os.makedirs(out_dir, exist_ok=True)
@@ -952,8 +992,9 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
         # Уставы ведомств (LSPD, EMS, Sheriff, SANG, министерства, USSS, Government...).
         # Разделы находим на главной по категории штата — работает для всех штатов.
         charter_sections = list(charters or [])
+        rules_url = None
+        done = {urlsplit(u).path.rstrip("/") for u in all_sections}
         if cat_id:
-            done = {urlsplit(u).path.rstrip("/") for u in all_sections}
             try:
                 for u in discover_charter_sections(page, cat_id):
                     if u in charter_sections or urlsplit(u).path.rstrip("/") in done:
@@ -961,8 +1002,45 @@ def run(sections: list[str], out_dir: str, only_author: bool, charters: list[str
                     charter_sections.append(u)
             except Exception as e:
                 log(f"  уставы: разделы ведомств найти не удалось ({e})")
+            try:
+                rules_url = find_server_rules_section(page, state_name)   # главная уже открыта
+            except Exception as e:
+                log(f"  серверные правила: раздел найти не удалось ({e})")
         held = False        # форум начал придерживать запросы — уставы добираем позже
         partial = False     # что-то не скачалось — старые документы не удаляем (save_results)
+
+        # «Дополнительные серверные правила» штата — как законы: сверка по дате последнего
+        # сообщения, качаем только изменившиеся темы, текст автора темы (правила пишет админ).
+        if rules_url and urlsplit(rules_url).path.rstrip("/") not in done:
+            srt = []
+            try:
+                srt = collect_threads(page, rules_url)
+            except Throttled:
+                held = True
+            except Exception as e:
+                log(f"  серверные правила: раздел не прочитался ({str(e).splitlines()[0][:160]})")
+                partial = True
+            if srt:
+                log(f"Дополнительные серверные правила: тем {len(srt)}")
+            for url, t in srt:
+                if held or url in seen:
+                    continue
+                seen.add(url)
+                hit = _cached_text(out_dir, cache, url)
+                if hit:
+                    results.append((hit[0], url, hit[1]))
+                    reused += 1
+                    continue
+                log(f"[правила сервера] {t}")
+                try:
+                    title, text = parse_thread(context, page, url, True)
+                    if len(text) > 200:
+                        results.append((title, url, text))
+                except Throttled:
+                    held = True
+                except Exception as e:
+                    log(f"    ошибка: {str(e).splitlines()[0][:200]}")
+                    partial = True
 
         def reopen(why="браузер закрылся"):
             """Браузер/вкладка закрылись (или вкладка зависла) посреди загрузки — открываем
@@ -1140,7 +1218,7 @@ def _main(argv=None) -> int:
     _, name, num, urls, only_author = SERVER_BY_ID[sid]
     log(f"Скачиваю законы штата RU{num} {name}...")
     rc = run(urls, os.path.join(APP_DIR, "laws", sid), only_author,
-             charters=charters_for(sid), cat_id=category_id(sid))
+             charters=charters_for(sid), cat_id=category_id(sid), state_name=name)
     if rc == 0:
         # Собираем памятки (справочник) по всем разделам из только что скачанных законов.
         try:
