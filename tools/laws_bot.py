@@ -13,8 +13,9 @@
 
 Защита:
   • штат не скачался → в index остаётся прошлая запись, старый архив на GitHub не трогаем;
-  • форум придерживает (код 7) → эту базу пропускаем, пауза 30 мин, дальше по очереди;
-  • главные базы (PRIORITY: Орландо, правила) — первыми в каждом запуске;
+  • форум придерживает (код 7) → запуск заканчивается, база уходит в конец очереди (index["tried"]);
+    запуски каждый час по 1–2 базы с медленным темпом (OTUS_BOT_GAP) — «не долбить» (владелец);
+  • главные базы (PRIORITY: Орландо, правила) — первыми, если их не проверяли 6+ часов;
   • между штатами пауза — не долбим форум.
 
 Локально:  python tools/laws_bot.py --only orlando --no-upload
@@ -41,11 +42,17 @@ OUT = os.path.join(ROOT, "laws_out")
 GAP_SEC = 300         # 5 мин между штатами: неизменённые темы не качаются, запросов мало
 HELD_GAP_SEC = 1800   # форум всё же придержал прошлый штат — ждём 30 минут
 THROTTLED = 7         # код update_laws: форум придерживает запросы
-# Главные базы — в начале КАЖДОГО запуска, пока форум «свежий» (владелец 24.11.2026: «главный штат
+# Главные базы — в начале запуска, пока форум «свежий» (владелец 24.11.2026: «главный штат
 # для скачивания — Орландо»). Раньше первыми шли 6 ни разу не скачанных штатов: каждую ночь они
 # падали первыми, Орландо не обновлялся с 20.11, правила проекта — с 19.11. Переопределяется
-# переменной OTUS_LAWS_PRIORITY («orlando,rules»).
+# переменной OTUS_LAWS_PRIORITY («orlando,rules»). Запуски теперь каждый час по 1–2 базы
+# («делать прям медленно, 16 часов»), поэтому главные идут первыми, только если их не проверяли
+# дольше PRIORITY_EVERY_H часов — иначе они забирали бы все места и до остальных штатов не доходило.
 PRIORITY = [x.strip() for x in os.environ.get("OTUS_LAWS_PRIORITY", "orlando,rules").split(",") if x.strip()]
+try:
+    PRIORITY_EVERY_H = float(os.environ.get("OTUS_LAWS_PRIORITY_EVERY_H") or 6)
+except ValueError:
+    PRIORITY_EVERY_H = 6.0
 
 
 def now() -> str:
@@ -141,14 +148,29 @@ def fetch(args: list[str]) -> tuple[int, bool, bool]:
     return pr.wait(), held, down
 
 
+def last_touch(job: str, index: dict) -> str:
+    """Когда базу в последний раз трогали: позже из двух дат — успешного обновления и НЕУДАЧНОЙ
+    попытки (index["tried"]). Без второй даты штат, который форум не отдаёт, стоял бы первым в
+    каждом запуске и занимал все места (при 1–2 базах за запуск до остальных бы не доходило).
+    Строка ISO; кривая/пустая — «очень давно»."""
+    rec = index.get("rules") if job == "rules" else (index.get("states") or {}).get(job)
+    d = rec.get("date") if isinstance(rec, dict) else ""
+    tried = index.get("tried") if isinstance(index.get("tried"), dict) else {}
+    t = tried.get(job)
+    return max(d if isinstance(d, str) else "", t if isinstance(t, str) else "")
+
+
+def hours_since(iso: str) -> float:
+    try:
+        then = datetime.datetime.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return float("inf")
+    return (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds() / 3600
+
+
 def pick_oldest(jobs: list, index: dict, n: int) -> list:
-    """n баз с самой старой датой в index.json; базы, которых на GitHub ещё нет, — первыми.
-    Дата — строка ISO из index (кривая/пустая — считается самой старой)."""
-    def date_of(job):
-        rec = index.get("rules") if job == "rules" else (index.get("states") or {}).get(job)
-        d = rec.get("date") if isinstance(rec, dict) else ""
-        return d if isinstance(d, str) else ""
-    return sorted(jobs, key=lambda j: (date_of(j), jobs.index(j)))[:max(1, n)]
+    """n баз, которые дольше всех не трогали (см. last_touch); которых нет и не пробовали — первыми."""
+    return sorted(jobs, key=lambda j: (last_touch(j, index), jobs.index(j)))[:max(1, n)]
 
 
 def main() -> int:
@@ -172,7 +194,7 @@ def main() -> int:
         # начале): если форум придержит и за ночь всё не успеется, следующей ночью бот начнёт
         # с недокачанного, но Орландо и правила — всё равно первыми.
         n = a.batch or len(jobs)
-        first = [j for j in PRIORITY if j in jobs]
+        first = [j for j in PRIORITY if j in jobs and hours_since(last_touch(j, index)) >= PRIORITY_EVERY_H]
         rest = pick_oldest([j for j in jobs if j not in first], index, len(jobs))
         jobs = (first + rest)[:max(1, n)]
         print("в этот запуск: " + ", ".join(jobs), flush=True)
@@ -180,8 +202,8 @@ def main() -> int:
     released = [False]
 
     def publish(z) -> bool:
-        """Выложить архив штата и index.json СРАЗУ после штата: раньше всё выкладывалось в самом
-        конце, и остановка бота (или сбой на 15-м штате) теряла всё скачанное."""
+        """Выложить архив штата (или только index.json, z=None) СРАЗУ после штата: раньше всё
+        выкладывалось в самом конце, и остановка бота (или сбой на 15-м штате) теряла всё скачанное."""
         index["date"] = now()
         os.makedirs(OUT, exist_ok=True)
         ip = os.path.join(OUT, "index.json")
@@ -192,14 +214,23 @@ def main() -> int:
         if not released[0]:
             ensure_release()
             released[0] = True
-        r = gh("release", "upload", TAG, z, ip, "--clobber", "-R", REPO)
+        r = gh("release", "upload", TAG, *([z] if z else []), ip, "--clobber", "-R", REPO)
         if r.returncode != 0:
             print(f"выкладка не удалась: {r.stderr.strip()[-300:]}")
             return False
-        print(f"  выложено на GitHub: {os.path.basename(z)}", flush=True)
+        print(f"  выложено на GitHub: {os.path.basename(z) if z else 'index.json'}", flush=True)
         return True
 
+    def mark_tried(job):
+        """Неудачная попытка: время — в index["tried"], база уходит в конец очереди (last_touch).
+        Прошлый архив базы на GitHub не трогаем — у людей остаётся рабочая версия."""
+        if not isinstance(index.get("tried"), dict):
+            index["tried"] = {}
+        index["tried"][job] = now()
+        publish(None)
+
     held_last = False
+    stopped_gently = False
     for i, job in enumerate(jobs):
         if i:
             # форум придержал прошлый штат — пережидаем дольше, чтобы не закрепить блокировку
@@ -207,22 +238,26 @@ def main() -> int:
         print(f"===== {job} =====", flush=True)
         rc, held_last, down = fetch(["--rules"] if job == "rules" else ["--server", job])
         if down and rc != 0:
-            # Форум не отвечает совсем (сегодня — блок по адресу после частых запусков).
-            # Стучаться в каждый следующий штат — только продлевать блок: стоп до следующей ночи.
-            print("Форум не открывается — останавливаюсь, попробую в следующий запуск.")
+            # Форум не отвечает совсем (блок по адресу после частых запусков).
+            # Стучаться в каждый следующий штат — только продлевать блок: стоп до следующего запуска.
+            print("Форум не открывается — останавливаюсь, попробую в следующий запуск.", flush=True)
+            mark_tried(job)
+            stopped_gently = True
             break
-        if rc == THROTTLED:
-            # Раньше здесь бот вставал до следующей ночи. Ночь 22–23.11 показала: после паузы форум
-            # снова отдаёт (Dallas и Boston скачались после двух придержанных штатов), поэтому —
-            # пауза HELD_GAP_SEC перед следующей базой и дальше по очереди; прошлая версия этой
-            # базы на GitHub остаётся.
-            held_last = True
-            print(f"{job}: форум придержал — в этот раз пропускаю, пауза {HELD_GAP_SEC // 60} мин "
-                  "перед следующей базой", flush=True)
-            continue
+        if rc == THROTTLED or (held_last and rc != 0):
+            # Форум придержал. Запуски теперь каждый час по 1–2 базы («не долбить, делать прям
+            # медленно» — владелец 24.11.2026), поэтому не пережидаем внутри запуска, а сразу
+            # заканчиваем: следующий запуск через час, с другого адреса GitHub. База — в конец очереди.
+            print(f"{job}: форум придержал — заканчиваю, продолжу в следующий запуск", flush=True)
+            mark_tried(job)
+            stopped_gently = True
+            break
         if rc != 0:
             print(f"{job}: не скачалось (код {rc}) — на GitHub остаётся прошлая версия", flush=True)
+            mark_tried(job)
             continue
+        if isinstance(index.get("tried"), dict):
+            index["tried"].pop(job, None)          # скачалась — отметка о неудаче больше не нужна
         if job == "rules":
             z = _zip("rules.zip", ["rules"])
         else:
@@ -240,8 +275,10 @@ def main() -> int:
             produced.append(z)
 
     if not produced:
-        print("Ничего не выложено.")
-        return 1
+        # Остановились сами (форум придержал) — это не сбой: следующий запуск через час. Красным
+        # помечаем только запуск, где ничего не вышло без такой причины.
+        print("Ничего не выложено." + (" Форум придержал — следующий запуск продолжит." if stopped_gently else ""))
+        return 0 if stopped_gently else 1
     print(f"Выложено за запуск: {len(produced)} архивов в {REPO} / {TAG}")
     return 0
 
